@@ -1724,7 +1724,7 @@ class APIConfigApp(QMainWindow):
         return count
     
     def check_replace_rules(self):
-        """检查替换规则并标记对应文件为绿色"""
+        """检查替换规则并标记对应文件：绿色表示有规则，红色表示无规则"""
         try:
             # 检查replace.json文件是否存在
             replace_json_path = 'replace.json'
@@ -1781,21 +1781,29 @@ class APIConfigApp(QMainWindow):
             # 重置所有文件的颜色
             self.reset_file_colors(self.file_tree.invisibleRootItem())
             
-            # 标记规则中的文件为绿色
-            marked_count = 0
-            marked_count += self.mark_files_in_tree(self.file_tree.invisibleRootItem(), rule_files)
+            # 标记文件并收集统计信息
+            stats = {'green_count': 0, 'red_count': 0}
+            red_items = []  # 存储红色标记的项目，用于展开
+            
+            self._mark_and_collect_files(self.file_tree.invisibleRootItem(), rule_files, stats, red_items)
+            
+            # 展开包含红色文件的文件夹
+            self._expand_red_file_parents(red_items)
             
             # 显示结果通知
-            if marked_count > 0:
+            green_count = stats['green_count']
+            red_count = stats['red_count']
+            total_files = green_count + red_count
+            if total_files > 0:
                 self.notification_manager.show_notification(
                     "✅ 检查完成", 
-                    f"已标记 {marked_count} 个文件为绿色\n这些文件在 replace.json 中有对应规则",
-                    "success"
+                    f"绿色: {green_count} 个文件有规则\n红色: {red_count} 个文件无规则\n已展开无规则文件所在位置",
+                    "success" if red_count == 0 else "warning"
                 )
             else:
                 self.notification_manager.show_notification(
-                    "⚠️ 无匹配文件", 
-                    "未找到与 replace.json 规则匹配的文件",
+                    "⚠️ 无文件检查", 
+                    "未找到任何文件进行检查",
                     "warning"
                 )
                 
@@ -1819,8 +1827,62 @@ class APIConfigApp(QMainWindow):
                 # 递归处理子项
                 self.reset_file_colors(item)
     
+    def _mark_and_collect_files(self, parent_item, rule_files, stats, red_items):
+        """标记文件并收集统计信息"""
+        from PyQt6.QtGui import QBrush, QColor
+        
+        for i in range(parent_item.childCount()):
+            item = parent_item.child(i)
+            
+            if item.childCount() > 0:
+                # 这是文件夹，递归处理
+                self._mark_and_collect_files(item, rule_files, stats, red_items)
+            else:
+                # 这是文件，检查是否在规则中
+                file_path = item.data(0, Qt.ItemDataRole.UserRole)
+                if file_path:
+                    # 标准化路径用于比较
+                    normalized_file_path = os.path.normpath(file_path)
+                    
+                    # 检查是否匹配规则中的任何文件
+                    has_rule = False
+                    for rule_file in rule_files:
+                        if self._is_file_match(normalized_file_path, rule_file):
+                            has_rule = True
+                            break
+                    
+                    if has_rule:
+                        # 设置绿色背景
+                        green_brush = QBrush(QColor(220, 255, 220))  # 浅绿色背景
+                        green_text = QBrush(QColor(0, 120, 0))       # 深绿色文字
+                        
+                        item.setBackground(0, green_brush)
+                        item.setForeground(0, green_text)
+                        stats['green_count'] += 1
+                    else:
+                        # 设置红色背景
+                        red_brush = QBrush(QColor(255, 220, 220))    # 浅红色背景
+                        red_text = QBrush(QColor(150, 0, 0))         # 深红色文字
+                        
+                        item.setBackground(0, red_brush)
+                        item.setForeground(0, red_text)
+                        stats['red_count'] += 1
+                        red_items.append(item)
+    
+    def _expand_red_file_parents(self, red_items):
+        """展开包含红色文件的所有父文件夹"""
+        expanded_parents = set()
+        
+        for red_item in red_items:
+            parent = red_item.parent()
+            while parent is not None:
+                if parent not in expanded_parents:
+                    parent.setExpanded(True)
+                    expanded_parents.add(parent)
+                parent = parent.parent()
+    
     def mark_files_in_tree(self, parent_item, rule_files):
-        """在文件树中标记规则文件为绿色"""
+        """在文件树中标记规则文件为绿色（保留兼容性）"""
         marked_count = 0
         
         for i in range(parent_item.childCount()):
