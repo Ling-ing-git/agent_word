@@ -15,10 +15,9 @@ def build_executable():
     # PyInstaller 参数配置
     args = [
         '--onefile',  # 打包成单个文件
-        '--windowed',  # Windows下不显示控制台窗口（可选）
+        '--console',  # 显示控制台窗口（需要看到程序输出）
         '--name=AgentWordProcessor',  # 可执行文件名称
         '--icon=icon.png',  # 图标文件（支持PNG格式）
-        '--add-data=agent_config.json;.',  # 包含配置文件
         '--distpath=./dist',  # 输出目录
         '--workpath=./build',  # 临时文件目录
         '--specpath=.',  # spec文件目录
@@ -34,12 +33,10 @@ def build_executable():
         '--hidden-import=contextlib',
         '--hidden-import=argparse',
         '--collect-all=openai',  # 收集openai的所有依赖
+        '--collect-all=lxml',   # 收集lxml的所有依赖
+        '--collect-all=PIL',    # 收集PIL的所有依赖
         'agent core.py'  # 主程序文件
     ]
-    
-    # 如果是Linux/Mac，移除windowed参数
-    if sys.platform != 'win32':
-        args = [arg for arg in args if arg != '--windowed']
     
     # 检查图标文件，支持多种格式
     icon_files = ['icon.png', 'icon.ico', 'icon.icns']

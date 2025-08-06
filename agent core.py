@@ -235,40 +235,52 @@ def load_config():
 
 # ---------- Python代码执行 ----------
 def execute_python_code(filename, timeout=60):
-    """安全执行Python代码"""
+    """安全执行Python代码 - 打包后兼容版本"""
     try:
         print(f"[执行] 正在运行Python脚本: {filename}")
         
-        # 使用subprocess执行，设置超时
-        result = subprocess.run(
-            [sys.executable, filename], 
-            capture_output=True, 
-            text=True, 
-            timeout=timeout,
-            cwd=os.getcwd()  # 设置工作目录
-        )
-        
-        output = ""
-        if result.stdout:
-            output += f"输出:\n{result.stdout}\n"
-        if result.stderr:
-            output += f"错误:\n{result.stderr}\n"
-        
-        if result.returncode == 0:
-            print(f"[执行成功] {filename}")
-            return f"✅ 执行成功\n{output}"
+        # 检查是否为打包后的环境
+        if getattr(sys, 'frozen', False):
+            # 打包后环境：直接读取文件内容并执行
+            print(f"[模式] 打包环境，使用直接执行模式")
+            with open(filename, 'r', encoding='utf-8') as f:
+                code_content = f.read()
+            return execute_python_code_direct(code_content, timeout)
         else:
-            print(f"[执行失败] {filename}, 返回码: {result.returncode}")
-            return f"❌ 执行失败 (返回码: {result.returncode})\n{output}"
+            # 开发环境：使用subprocess
+            print(f"[模式] 开发环境，使用subprocess模式")
+            result = subprocess.run(
+                [sys.executable, filename], 
+                capture_output=True, 
+                text=True, 
+                timeout=timeout,
+                cwd=os.getcwd()
+            )
+            
+            output = ""
+            if result.stdout:
+                output += f"输出:\n{result.stdout}\n"
+            if result.stderr:
+                output += f"错误:\n{result.stderr}\n"
+            
+            if result.returncode == 0:
+                print(f"[执行成功] {filename}")
+                return f"✅ 执行成功\n{output}"
+            else:
+                print(f"[执行失败] {filename}, 返回码: {result.returncode}")
+                return f"❌ 执行失败 (返回码: {result.returncode})\n{output}"
             
     except subprocess.TimeoutExpired:
         error_msg = f"❌ 执行超时 (>{timeout}秒)"
         print(f"[执行超时] {filename}")
         return error_msg
         
-    except FileNotFoundError:
-        error_msg = f"❌ Python解释器未找到"
-        print(f"[错误] Python解释器未找到")
+    except FileNotFoundError as e:
+        if getattr(sys, 'frozen', False):
+            error_msg = f"❌ 脚本文件未找到: {filename}"
+        else:
+            error_msg = f"❌ Python解释器未找到"
+        print(f"[错误] {error_msg}")
         return error_msg
         
     except Exception as e:
@@ -287,13 +299,19 @@ def execute_system_command(command, timeout=30):
         if any(dangerous in command.lower() for dangerous in dangerous_commands):
             return "❌ 拒绝执行危险命令"
         
+        # 设置工作目录，确保在正确的位置执行命令
+        work_dir = os.getcwd()
+        if getattr(sys, 'frozen', False):
+            # 打包后环境，使用可执行文件所在目录
+            work_dir = os.path.dirname(sys.executable)
+        
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=os.getcwd()
+            cwd=work_dir
         )
         
         output = ""
@@ -323,10 +341,48 @@ def execute_python_code_direct(code, timeout=60):
     try:
         print(f"[执行] 正在直接执行Python代码")
         
-        # 预导入常用库
+        # 预导入常用库到执行环境
         import io
         import sys
+        import os
+        import json
+        import time
+        import subprocess
+        from pathlib import Path
         from contextlib import redirect_stdout, redirect_stderr
+        
+        # 为执行的代码准备全局环境
+        exec_globals = {
+            '__builtins__': __builtins__,
+            'io': io,
+            'sys': sys,
+            'os': os,
+            'json': json,
+            'time': time,
+            'subprocess': subprocess,
+            'Path': Path,
+            'print': print,  # 确保print函数可用
+        }
+        
+        # 尝试导入额外的库（如果可用）
+        try:
+            import lxml
+            exec_globals['lxml'] = lxml
+        except ImportError:
+            pass
+        
+        try:
+            from PIL import Image
+            exec_globals['Image'] = Image
+            exec_globals['PIL'] = __import__('PIL')
+        except ImportError:
+            pass
+        
+        try:
+            import openai
+            exec_globals['openai'] = openai
+        except ImportError:
+            pass
         
         # 创建输出捕获
         stdout_capture = io.StringIO()
@@ -334,7 +390,7 @@ def execute_python_code_direct(code, timeout=60):
         
         # 执行代码并捕获输出
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            exec(code)
+            exec(code, exec_globals)
         
         output = ""
         stdout_output = stdout_capture.getvalue()
