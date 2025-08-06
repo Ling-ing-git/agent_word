@@ -17,7 +17,7 @@ def build_executable():
         '--onefile',  # 打包成单个文件
         '--windowed',  # Windows下不显示控制台窗口（可选）
         '--name=AgentWordProcessor',  # 可执行文件名称
-        '--icon=icon.ico',  # 图标文件（如果有的话）
+        '--icon=icon.png',  # 图标文件（支持PNG格式）
         '--add-data=agent_config.json;.',  # 包含配置文件
         '--distpath=./dist',  # 输出目录
         '--workpath=./build',  # 临时文件目录
@@ -41,9 +41,22 @@ def build_executable():
     if sys.platform != 'win32':
         args = [arg for arg in args if arg != '--windowed']
     
-    # 如果没有图标文件，移除图标参数
-    if not os.path.exists('icon.ico'):
+    # 检查图标文件，支持多种格式
+    icon_files = ['icon.png', 'icon.ico', 'icon.icns']
+    icon_found = None
+    for icon_file in icon_files:
+        if os.path.exists(icon_file):
+            icon_found = icon_file
+            break
+    
+    if icon_found:
+        # 更新图标参数
+        args = [arg if not arg.startswith('--icon') else f'--icon={icon_found}' for arg in args]
+        print(f"🎨 使用图标文件: {icon_found}")
+    else:
+        # 移除图标参数
         args = [arg for arg in args if not arg.startswith('--icon')]
+        print("⚠️ 未找到图标文件，将使用默认图标")
     
     print("开始构建可执行文件...")
     print(f"参数: {' '.join(args)}")
