@@ -103,6 +103,38 @@ def replace_in_xml_bytes(xml_bytes: bytes, old: str, new: str) -> Tuple[bytes, i
 
 # —— 扫描相关 ——
 
+# 新增：用图形界面对话框展示文本（若环境不支持图形界面则回退到控制台打印）
+def show_text_dialog(title: str, text: str) -> None:
+    """显示一个带滚动条的对话框展示文本；如果 GUI 不可用则打印到控制台。
+
+    在 Linux/服务器无显示环境时，Tkinter 可能因为缺少 DISPLAY 而失败，
+    我们捕获异常并回退到 print。
+    """
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext
+
+        root = tk.Tk()
+        root.title(title)
+        # 合理默认尺寸，可调整
+        root.geometry("800x600")
+
+        # 文本区域（只读）
+        st = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+        st.pack(fill=tk.BOTH, expand=True)
+        st.insert(tk.END, text)
+        st.configure(state="disabled")
+
+        # 关闭按钮
+        btn = tk.Button(root, text="OK", command=root.destroy)
+        btn.pack(pady=8)
+
+        root.mainloop()
+    except Exception:
+        # 无 GUI 环境或其他异常时，退回控制台输出
+        print(text)
+
+
 def extract_text_from_xml_bytes(xml_bytes: bytes) -> str:
     """从“单个 XML 文本”中提取可见文字：把所有 w:t 的文本直接拼接。
 
@@ -181,22 +213,42 @@ def _print_usage() -> None:
     print("Usage:")
     print("  Replace: python replace_docx_text.py <input.docx> <output.docx> <old_text> <new_text>")
     print("  Scan   : python replace_docx_text.py scan <input.docx> [output.txt]")
+    print("  Scan GUI: python replace_docx_text.py scan <input.docx> --dialog")
 
 
 def main() -> None:
     """命令行入口：根据参数执行“替换”或“扫描”。"""
-    # 扫描模式：python replace_docx_text.py scan in.docx [out.txt]
-    if len(sys.argv) in (3, 4) and sys.argv[1] == "scan":
-        src = sys.argv[2]
-        out_path = sys.argv[3] if len(sys.argv) == 4 else None
+    # 扫描模式：
+    #   - 打印到屏幕：python replace_docx_text.py scan in.docx
+    #   - 写入文件  ：python replace_docx_text.py scan in.docx out.txt
+    #   - 弹出对话框：python replace_docx_text.py scan in.docx --dialog
+    if len(sys.argv) >= 3 and sys.argv[1] == "scan":
+        args = sys.argv[2:]
+        if not args:
+            _print_usage()
+            sys.exit(1)
+        src = args[0]
+        dialog = False
+        out_path = None
+        # 解析可选参数
+        if len(args) >= 2:
+            if args[1] == "--dialog":
+                dialog = True
+            else:
+                out_path = args[1]
+        # 第三个参数若存在且是 --dialog，则同时支持输出文件 + 弹窗
+        if len(args) >= 3 and args[2] == "--dialog":
+            dialog = True
+
         text = scan_docx_text(src)
+        if dialog:
+            show_text_dialog("Scanned Text", text)
+            return
         if out_path:
-            # 写入到文件（UTF-8）
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(text)
             print(f"Scanned text written to: {out_path}")
         else:
-            # 打印到标准输出
             print(text)
         return
 
