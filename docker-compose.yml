@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  agent-word-processor:
+    build: .
+    container_name: agent-word-processor
+    volumes:
+      # 挂载配置文件
+      - ./agent_config.json:/app/config/agent_config.json:ro
+      # 挂载数据目录（保存生成的文件）
+      - ./data:/app/data
+      - ./folder_scan_results:/app/folder_scan_results
+      - ./word_extracted_data:/app/word_extracted_data
+      # 挂载待处理的文件目录
+      - ./input:/app/input
+    environment:
+      - PYTHONUNBUFFERED=1
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
