@@ -309,10 +309,29 @@ def _set_pic_extents(drawing: etree._Element, new_cx: int, new_cy: int):
             e.set("cx", str(int(new_cx))); e.set("cy", str(int(new_cy)))
 
 def _scale_fit(emu_w: int, emu_h: int, box_w: int, box_h: int) -> Tuple[int, int]:
+    # 约束：不放大（展示面积不大于原图）；且至少有一条边等于“原图展示大小”或等于盒子限制边
+    # - 若原图两边都不超过盒子：直接用原图尺寸（不放大；两边都等于“原图展示大小”）
+    # - 若需要缩小以适配盒子：选取限制边等于盒子对应边，另一边按比例四舍五入
     if emu_w <= 0 or emu_h <= 0 or box_w <= 0 or box_h <= 0:
         return emu_w, emu_h
-    scale = min(box_w / emu_w, box_h / emu_h, 1.0)
-    return int(emu_w * scale), int(emu_h * scale)
+    # 不放大：原图本身已经小于等于盒子
+    if emu_w <= box_w and emu_h <= box_h:
+        return emu_w, emu_h
+    # 需要缩小：保证至少有一条边等于盒子边
+    ratio_w = box_w / emu_w
+    ratio_h = box_h / emu_h
+    if ratio_w <= ratio_h:
+        new_w = box_w
+        new_h = int(round(emu_h * ratio_w))
+    else:
+        new_h = box_h
+        new_w = int(round(emu_w * ratio_h))
+    # 保险起见不超过盒子
+    if new_w > box_w:
+        new_w = box_w
+    if new_h > box_h:
+        new_h = box_h
+    return int(new_w), int(new_h)
 
 def _ensure_content_type_default(file_map: Dict[str, bytes], ext: str):
     ext = ext.lower().lstrip(".")
