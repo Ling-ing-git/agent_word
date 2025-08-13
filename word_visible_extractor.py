@@ -468,10 +468,10 @@ def _extract_text_runs(p: ET.Element, styles: StylesResolver, numbering: Numberi
                     type='text',
                     data={
                         'text': text,
-                        'styleSummary': rstyle.to_summary_str(),
+                        'style': build_style_display(rstyle),
                         'styleSummaryCn': build_style_summary_cn(rstyle),
-                        'styleDisplay': build_style_display(rstyle),
-                        'style': rstyle.to_json(),
+                        'styleRaw': rstyle.to_json(),
+                        'styleSummary': rstyle.to_summary_str(),
                     },
                 )
                 if list_label:
@@ -494,10 +494,10 @@ def _extract_text_runs(p: ET.Element, styles: StylesResolver, numbering: Numberi
                             data={
                                 'text': link_text,
                                 'rId': rid,
-                                'styleSummary': rstyle.to_summary_str(),
+                                'style': build_style_display(rstyle),
                                 'styleSummaryCn': build_style_summary_cn(rstyle),
-                                'styleDisplay': build_style_display(rstyle),
-                                'style': rstyle.to_json(),
+                                'styleRaw': rstyle.to_json(),
+                                'styleSummary': rstyle.to_summary_str(),
                             },
                         )
                     )
@@ -511,7 +511,7 @@ def _extract_text_runs(p: ET.Element, styles: StylesResolver, numbering: Numberi
                     text = _collect_text_from_run(sub)
                     if text:
                         rstyle = styles.resolve_run_style(sub, p)
-                        items.append(VisibleItem(type='text', data={'text': text, 'styleSummary': rstyle.to_summary_str(), 'styleSummaryCn': build_style_summary_cn(rstyle), 'styleDisplay': build_style_display(rstyle), 'style': rstyle.to_json()}))
+                        items.append(VisibleItem(type='text', data={'text': text, 'style': build_style_display(rstyle), 'styleSummaryCn': build_style_summary_cn(rstyle), 'styleRaw': rstyle.to_json(), 'styleSummary': rstyle.to_summary_str()}))
         # ignore other nodes
 
     return items
@@ -742,3 +742,15 @@ if __name__ == '__main__':
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(json.dumps(result, ensure_ascii=False))
+
+# Single function API
+
+def scan_docx_to_json(docx_path: str, pretty: bool = False) -> str:
+    items = extract_visible_content(
+        docx_path,
+        include_headers=True,
+        include_footers=True,
+        include_footnotes=True,
+        include_endnotes=True,
+    )
+    return json.dumps(items, ensure_ascii=False, indent=2 if pretty else None)
