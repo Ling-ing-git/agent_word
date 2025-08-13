@@ -76,7 +76,7 @@ def _paragraph_text(p: etree._Element) -> str:
 def _read_xml(z: ZipFile, name: str) -> Optional[etree._Element]:
     try:
         return etree.fromstring(z.read(name))
-    except KeyError:
+    except (KeyError, etree.XMLSyntaxError, OSError, ValueError):
         return None
 
 def _build_rel_map(z: ZipFile, rels_path: str) -> Dict[str, str]:
@@ -91,10 +91,32 @@ def _build_rel_map(z: ZipFile, rels_path: str) -> Dict[str, str]:
     for rel in rels.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
         rid = rel.get("Id")
         target = rel.get("Target")
+        rtype = rel.get("Type")
+        # 仅保留非超链接（主要用于图片）
+        if rtype == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink":
+            continue
         if rid and target:
             # 规范里 Target 是相对路径；这里直接记录相对路径
             rel_map[rid] = target
     return rel_map
+
+# 新增：构建超链接关系映射 rId -> {target, mode}
+
+def _build_hyperlink_rel_map(z: ZipFile, rels_path: str) -> Dict[str, Dict[str, Optional[str]]]:
+    hyper_map: Dict[str, Dict[str, Optional[str]]] = {}
+    rels = _read_xml(z, rels_path)
+    if rels is None:
+        return hyper_map
+    for rel in rels.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
+        rid = rel.get("Id")
+        rtype = rel.get("Type")
+        if rtype != "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink":
+            continue
+        target = rel.get("Target")
+        mode = rel.get("TargetMode")  # External / Internal
+        if rid and target:
+            hyper_map[rid] = {"target": target, "mode": mode}
+    return hyper_map
 
 def _basename(path: str) -> str:
     return path.rsplit("/", 1)[-1] if "/" in path else path
@@ -186,10 +208,60 @@ def _drawables_in_paragraph(p: etree._Element, rel_map: Dict[str, str]) -> List[
 
     return blocks
 
-def _extract_blocks_from_container(container: etree._Element, rel_map: Dict[str, str]) -> List[Dict]:
+# 新增：提取段落内的超链接块
+
+def _hyperlinks_in_paragraph(p: etree._Element, hyper_map: Dict[str, Dict[str, Optional[str]]]) -> List[Dict]:
+    blocks: List[Dict] = []
+    for h in p.xpath(".//w:hyperlink[not(ancestor::mc:Fallback)]", namespaces=NS):
+        if _nearest_para(h) is not p:
+            continue
+        # 采集该超链接内的可见文本
+        parts: List[str] = []
+        for node in h.iter():
+            if _is_deleted_or_field(node) or _in_fallback(node) or _is_hidden_run(node):
+                continue
+            ln = _ln(node.tag)
+            if ln == "t" and node.text:
+                parts.append(node.text)
+            elif ln in ("br", "cr"):
+                parts.append("\n")
+            elif ln == "tab":
+                parts.append("\t")
+        link_text = "".join(parts)
+        if not link_text:
+            continue
+        rid = h.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        anchor = h.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}anchor")
+        tooltip = h.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tooltip")
+        if rid and rid in hyper_map:
+            target = hyper_map[rid].get("target")
+            mode = (hyper_map[rid].get("mode") or "").lower()
+            if mode == "external":
+                blk = {"type": "hyperlink", "text": link_text, "url": target, "relId": rid, "external": True}
+                if tooltip:
+                    blk["tooltip"] = tooltip
+                blocks.append(blk)
+            else:
+                # 内部链接，可能 target 形如 '#Bookmark'
+                anchor_name = anchor
+                if not anchor_name and target:
+                    anchor_name = target[1:] if target.startswith("#") else target
+                blk = {"type": "hyperlink", "text": link_text, "anchor": anchor_name, "relId": rid, "external": False}
+                if tooltip:
+                    blk["tooltip"] = tooltip
+                blocks.append(blk)
+        elif anchor:
+            blk = {"type": "hyperlink", "text": link_text, "anchor": anchor, "external": False}
+            if tooltip:
+                blk["tooltip"] = tooltip
+            blocks.append(blk)
+        # 若既无 rid 也无 anchor，忽略
+    return blocks
+
+def _extract_blocks_from_container(container: etree._Element, rel_map: Dict[str, str], hyper_map: Dict[str, Dict[str, Optional[str]]]) -> List[Dict]:
     """
     从容器（w:body / w:txbxContent / w:tc）按顺序抽取块：
-    - 段落：paragraph + 段落中的 drawables（image/shape）+ 段落中的文本框（textbox，递归）
+    - 段落：paragraph + 段落中的 drawables（image/shape）+ 段落中的文本框（textbox，递归）+ 段落中的超链接（hyperlink）
     - 表格：table.rows[row][col] = 块数组（递归）
     """
     blocks: List[Dict] = []
@@ -215,16 +287,20 @@ def _extract_blocks_from_container(container: etree._Element, rel_map: Dict[str,
                 content = txbx.find(".//w:txbxContent", namespaces=NS)
                 if content is None:
                     continue
-                children = _extract_blocks_from_container(content, rel_map)
+                children = _extract_blocks_from_container(content, rel_map, hyper_map)
                 if children:
                     blocks.append({"type": "textbox", "children": children})
+
+            # 段落内的超链接（按出现顺序追加）
+            hyperlinks = _hyperlinks_in_paragraph(child, hyper_map)
+            blocks.extend(hyperlinks)
 
         elif tag == "tbl":
             rows: List[List[List[Dict]]] = []
             for tr in child.xpath("./w:tr[not(ancestor::mc:Fallback)]", namespaces=NS):
                 row_cells: List[List[Dict]] = []
                 for tc in tr.xpath("./w:tc", namespaces=NS):
-                    cell_blocks = _extract_blocks_from_container(tc, rel_map)
+                    cell_blocks = _extract_blocks_from_container(tc, rel_map, hyper_map)
                     row_cells.append(cell_blocks)
                 rows.append(row_cells)
             if rows:
@@ -233,18 +309,36 @@ def _extract_blocks_from_container(container: etree._Element, rel_map: Dict[str,
     return blocks
 
 def export_document_blocks(docx_path: str) -> List[Dict]:
-    with ZipFile(docx_path) as z:
-        # 构建主文档关系映射（图片 rId -> media 路径）
-        rel_map = _build_rel_map(z, "word/_rels/document.xml.rels")
+    try:
+        with ZipFile(docx_path) as z:
+            # 构建主文档关系映射（图片 rId -> media 路径；超链接 rId -> target/mode）
+            rels_path = "word/_rels/document.xml.rels"
+            rel_map = _build_rel_map(z, rels_path)
+            hyper_map = _build_hyperlink_rel_map(z, rels_path)
 
-        root = _read_xml(z, "word/document.xml")
-        if root is None:
-            return []
-        body = root.find(".//w:body", namespaces=NS)
-        if body is None:
-            return []
-        return _extract_blocks_from_container(body, rel_map)
+            root = _read_xml(z, "word/document.xml")
+            if root is None:
+                return []
+            body = root.find(".//w:body", namespaces=NS)
+            if body is None:
+                return []
+            return _extract_blocks_from_container(body, rel_map, hyper_map)
+    except FileNotFoundError:
+        # 文件不存在
+        return []
+    except Exception:
+        # 其他异常（包括 BadZipFile 等），返回空
+        return []
 
 if __name__ == "__main__":
-    blocks = export_document_blocks('example.docx')
-    sys.stdout.write(json.dumps(blocks, ensure_ascii=False, indent=2))
+    try:
+        docx_path = sys.argv[1]
+    except IndexError:
+        sys.stderr.write("Usage: python word_scan.py <input.docx>\n")
+        sys.exit(2)
+    try:
+        blocks = export_document_blocks(docx_path)
+        sys.stdout.write(json.dumps(blocks, ensure_ascii=False, indent=2))
+    except Exception as e:
+        sys.stderr.write(f"Error: {e}\n")
+        sys.exit(1)
