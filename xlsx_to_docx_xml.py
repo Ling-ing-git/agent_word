@@ -14,11 +14,14 @@ Optional flags:
   --sheets SHEET1 SHEET2     Only include specified sheet names (default: all)
   --max-rows N               Limit rows per sheet (default: no limit)
   --max-cols N               Limit columns per sheet (default: auto)
+  --separator-blank-rows N   Split tables by N consecutive empty rows (default: 1)
+  --trim-empty-cols          Trim trailing empty columns per table (default: off)
 
 Note:
 - Numbers/dates are not formatted; values are taken as-is from the XML
 - Shared strings and inline strings are supported
 - Rich text runs are concatenated
+- Tables are split by blank-row separators and each table starts on a new page
 """
 
 from __future__ import annotations
@@ -114,15 +117,23 @@ def extract_workbook_sheets(zf: zipfile.ZipFile) -> List[Tuple[str, str]]:
     return sheets
 
 
-def extract_sheet_grid(zf: zipfile.ZipFile, sheet_path: str, shared_strings: List[str], max_rows: Optional[int] = None, max_cols: Optional[int] = None) -> List[List[str]]:
+def extract_sheet_grid(
+    zf: zipfile.ZipFile,
+    sheet_path: str,
+    shared_strings: List[str],
+    max_rows: Optional[int] = None,
+    max_cols: Optional[int] = None,
+) -> List[List[str]]:
     sheet = read_zip_xml(zf, sheet_path)
     if sheet is None:
         return []
 
     rows_map: Dict[int, Dict[int, str]] = {}
     max_col_index = -1
+    last_row_index = -1
 
     for row in sheet.findall(f".//{{{NS_SS}}}row"):
+        # Row index may be absent; derive from first cell if needed
         for cell in row.findall(f".//{{{NS_SS}}}c"):
             cell_ref = cell.attrib.get("r")
             if not cell_ref:
@@ -166,24 +177,94 @@ def extract_sheet_grid(zf: zipfile.ZipFile, sheet_path: str, shared_strings: Lis
             rows_map[row_idx][col_idx] = text_value
             if col_idx > max_col_index:
                 max_col_index = col_idx
+            if row_idx > last_row_index:
+                last_row_index = row_idx
 
             if max_rows is not None and row_idx + 1 >= max_rows:
                 # Still consume row for padding, but skip further cells beyond limit
                 continue
 
-    if max_cols is not None:
+    if max_cols is not None and max_col_index >= 0:
         max_col_index = min(max_col_index, max_cols - 1)
 
-    # Build dense grid
+    # Build dense grid including blank (missing) rows
     grid: List[List[str]] = []
-    for row_idx in sorted(rows_map.keys()):
-        if max_rows is not None and row_idx >= max_rows:
-            break
-        row_dict = rows_map[row_idx]
-        row_list = [row_dict.get(col_idx, "") for col_idx in range(max_col_index + 1)]
-        grid.append(row_list)
+    if last_row_index >= 0 and max_col_index >= -1:
+        last_dense_row = last_row_index
+        if max_rows is not None:
+            last_dense_row = min(last_dense_row, max_rows - 1)
+        if max_col_index < 0:
+            # No cells at all; return empty grid
+            return []
+        for row_idx in range(0, last_dense_row + 1):
+            row_dict = rows_map.get(row_idx, {})
+            row_list = [row_dict.get(col_idx, "") for col_idx in range(max_col_index + 1)]
+            grid.append(row_list)
 
     return grid
+
+
+def is_empty_row(row: List[str]) -> bool:
+    return all((cell is None or cell == "") for cell in row)
+
+
+def trim_trailing_empty_columns(grid: List[List[str]]) -> List[List[str]]:
+    if not grid:
+        return grid
+    last_non_empty_col = -1
+    for row in grid:
+        for col_idx, val in enumerate(row):
+            if val is not None and val != "":
+                if col_idx > last_non_empty_col:
+                    last_non_empty_col = col_idx
+    if last_non_empty_col == -1:
+        return [[""]]
+    trimmed: List[List[str]] = []
+    for row in grid:
+        trimmed.append(row[: last_non_empty_col + 1])
+    return trimmed
+
+
+def split_grid_into_tables(grid: List[List[str]], min_blank_rows_between: int = 1) -> List[List[List[str]]]:
+    if not grid:
+        return []
+    tables: List[List[List[str]]] = []
+    current: List[List[str]] = []
+    blank_run = 0
+
+    for row in grid:
+        if is_empty_row(row):
+            blank_run += 1
+            current.append(row)
+            continue
+        # Non-empty row
+        if blank_run >= min_blank_rows_between and current:
+            # Cut off the separator rows from current
+            if min_blank_rows_between > 0:
+                current = current[:-blank_run]
+            # Trim leading/trailing empty rows
+            while current and is_empty_row(current[0]):
+                current.pop(0)
+            while current and is_empty_row(current[-1]):
+                current.pop()
+            if current:
+                tables.append(current)
+            current = []
+        blank_run = 0
+        current.append(row)
+
+    # Finalize last segment
+    if current:
+        if blank_run >= min_blank_rows_between and min_blank_rows_between > 0:
+            current = current[:-blank_run]
+        while current and is_empty_row(current[0]):
+            current.pop(0)
+        while current and is_empty_row(current[-1]):
+            current.pop()
+        if current:
+            tables.append(current)
+
+    return tables
 
 
 def build_word_paragraph(text: str) -> ET.Element:
@@ -197,6 +278,14 @@ def build_word_paragraph(text: str) -> ET.Element:
         t.text = part
         if idx < len(parts) - 1:
             ET.SubElement(r, f"{{{NS_W}}}br")
+    return p
+
+
+def build_page_break_paragraph() -> ET.Element:
+    p = ET.Element(f"{{{NS_W}}}p")
+    r = ET.SubElement(p, f"{{{NS_W}}}r")
+    br = ET.SubElement(r, f"{{{NS_W}}}br")
+    br.set(f"{{{NS_W}}}type", "page")
     return p
 
 
@@ -227,13 +316,13 @@ def build_word_document_xml(sheets: List[Tuple[str, List[List[str]]]]) -> bytes:
         title_p = build_word_paragraph(f"Sheet: {sheet_name}")
         body.append(title_p)
 
-        # Table for the sheet
+        # Table for the sheet (or table segment)
         tbl = build_word_table(grid)
         body.append(tbl)
 
-        # Spacer paragraph between sheets
+        # Page break between tables (not after the last one)
         if idx < len(sheets) - 1:
-            body.append(ET.Element(f"{{{NS_W}}}p"))
+            body.append(build_page_break_paragraph())
 
     # Section properties (required end element in a valid Word doc)
     sectPr = ET.SubElement(body, f"{{{NS_W}}}sectPr")
@@ -283,7 +372,15 @@ def write_docx(document_xml: bytes, out_path: str) -> None:
         zf.writestr("word/document.xml", document_xml)
 
 
-def xlsx_to_docx(xlsx_path: str, docx_path: str, only_sheets: Optional[List[str]] = None, max_rows: Optional[int] = None, max_cols: Optional[int] = None) -> None:
+def xlsx_to_docx(
+    xlsx_path: str,
+    docx_path: str,
+    only_sheets: Optional[List[str]] = None,
+    max_rows: Optional[int] = None,
+    max_cols: Optional[int] = None,
+    separator_blank_rows: int = 1,
+    trim_empty_cols: bool = False,
+) -> None:
     with zipfile.ZipFile(xlsx_path, "r") as zf:
         shared = extract_shared_strings(zf)
         sheets_info = extract_workbook_sheets(zf)
@@ -292,8 +389,21 @@ def xlsx_to_docx(xlsx_path: str, docx_path: str, only_sheets: Optional[List[str]
         for sheet_name, sheet_target in sheets_info:
             if only_sheets and sheet_name not in only_sheets:
                 continue
-            grid = extract_sheet_grid(zf, sheet_target, shared, max_rows=max_rows, max_cols=max_cols)
-            prepared.append((sheet_name, grid))
+            grid = extract_sheet_grid(
+                zf,
+                sheet_target,
+                shared,
+                max_rows=max_rows,
+                max_cols=max_cols,
+            )
+            tables = split_grid_into_tables(grid, min_blank_rows_between=separator_blank_rows)
+            if not tables:
+                prepared.append((sheet_name, []))
+            else:
+                for t in tables:
+                    if trim_empty_cols:
+                        t = trim_trailing_empty_columns(t)
+                    prepared.append((sheet_name, t))
 
     document_xml = build_word_document_xml(prepared)
     write_docx(document_xml, docx_path)
@@ -306,6 +416,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sheets", nargs="*", default=None, help="Only include these sheet names")
     parser.add_argument("--max-rows", type=int, default=None, help="Limit number of rows per sheet")
     parser.add_argument("--max-cols", type=int, default=None, help="Limit number of columns per sheet")
+    parser.add_argument("--separator-blank-rows", type=int, default=1, help="Split tables by N consecutive empty rows")
+    parser.add_argument("--trim-empty-cols", action="store_true", help="Trim trailing empty columns per table")
     return parser.parse_args(argv)
 
 
@@ -318,6 +430,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             only_sheets=args.sheets,
             max_rows=args.max_rows,
             max_cols=args.max_cols,
+            separator_blank_rows=args.separator_blank_rows,
+            trim_empty_cols=args.trim_empty_cols,
         )
     except Exception as exc:
         sys.stderr.write(f"Error: {exc}\n")
