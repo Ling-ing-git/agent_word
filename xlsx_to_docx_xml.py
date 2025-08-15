@@ -35,6 +35,7 @@ import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
+import math
 
 # Namespaces
 NS_SS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -297,15 +298,23 @@ def estimate_table_height_twips(grid: List[List[str]], font_size_half_points: in
 
 
 def choose_font_size_for_grid(grid: List[List[str]], compact: bool) -> int:
-    # Candidate font sizes (half-points): 11pt, 10pt, 9pt, 8pt, 7pt, 6pt
-    candidates = [22, 20, 18, 16, 14, 12]
-    # Reserve some space for the title paragraph
-    title_reserved_twips = int(9 * 20 * 1.2)  # assume ~9pt title height
+    # Compute column widths based on page text width
+    col_widths = compute_column_widths_twips(grid if grid else [[""]], TEXT_WIDTH_TWIPS)
+    # Binary search the maximum half-point size that fits
+    min_half, max_half = 10, 36  # 5pt .. 18pt
+    title_reserved_twips = int(10 * 20 * 1.2)  # ~10pt title height
     available = max(0, TEXT_HEIGHT_TWIPS - title_reserved_twips)
-    for half_pt in candidates:
-        if estimate_table_height_twips(grid, half_pt, compact=True) <= available:
-            return half_pt
-    return candidates[-1]
+    best = min_half
+    lo, hi = min_half, max_half
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        height = estimate_table_height_twips_wrapped(grid, col_widths, mid, compact=True)
+        if height <= available:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def build_word_paragraph(text: str, font_size_half_points: Optional[int] = None, compact: bool = False) -> ET.Element:
@@ -339,6 +348,122 @@ def build_page_break_paragraph() -> ET.Element:
     br = ET.SubElement(r, f"{{{NS_W}}}br")
     br.set(f"{{{NS_W}}}type", "page")
     return p
+
+
+# New: content width estimation and proportional scaling helpers
+
+def is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF or
+        0x3400 <= code <= 0x4DBF or
+        0x3040 <= code <= 0x30FF or
+        0xAC00 <= code <= 0xD7AF
+    )
+
+
+def measure_text_twips(text: str, font_half_points: int) -> int:
+    font_points = max(1.0, font_half_points / 2.0)
+    em_twips = font_points * 20.0
+    total = 0.0
+    for ch in text:
+        if ch == "\t":
+            total += em_twips * 4
+        elif ch == " ":
+            total += em_twips * 0.25
+        elif is_cjk(ch):
+            total += em_twips * 1.0
+        else:
+            total += em_twips * 0.55
+    return int(total)
+
+
+def compute_content_widths_twips(grid: List[List[str]], font_half_points: int) -> List[int]:
+    num_cols = max((len(r) for r in grid), default=1)
+    widths = [0 for _ in range(num_cols)]
+    for row in grid:
+        for c in range(num_cols):
+            text = row[c] if c < len(row) else ""
+            w = measure_text_twips(text, font_half_points)
+            if w > widths[c]:
+                widths[c] = w
+    # Ensure minimum per-column width to avoid zero width
+    widths = [max(80, w) for w in widths]  # >= 4pt
+    return widths
+
+
+def normalize_widths_to_total(widths: List[int], total_twips: int) -> List[int]:
+    s = sum(widths) or 1
+    scaled = [max(40, int(w * total_twips / s)) for w in widths]
+    # Fix rounding drift
+    diff = total_twips - sum(scaled)
+    if diff != 0:
+        scaled[-1] += diff
+    return scaled
+
+
+def estimate_cell_lines(text: str, col_width_twips: int, font_half_points: int) -> int:
+    if not text:
+        return 1
+    lines = 0
+    for raw_line in text.split("\n"):
+        width = measure_text_twips(raw_line, font_half_points)
+        needed = max(1, math.ceil(width / max(1, col_width_twips)))
+        lines += needed
+    return max(1, lines)
+
+
+def estimate_table_height_twips_wrapped(
+    grid: List[List[str]],
+    col_widths_twips: List[int],
+    font_size_half_points: int,
+    compact: bool,
+) -> int:
+    if not grid:
+        return 0
+    cell_margin_twips = 36 if compact else 108
+    line_height_twips = int((max(1.0, font_size_half_points / 2.0)) * 20 * 1.2)
+    total = 0
+    num_cols = max((len(r) for r in grid), default=1)
+    if len(col_widths_twips) < num_cols:
+        extra = [col_widths_twips[-1]] * (num_cols - len(col_widths_twips))
+        col_widths = col_widths_twips + extra
+    else:
+        col_widths = col_widths_twips[:num_cols]
+    for row in grid:
+        max_lines = 1
+        for c_idx in range(num_cols):
+            cell_text = row[c_idx] if c_idx < len(row) else ""
+            lines = estimate_cell_lines(cell_text, col_widths[c_idx], font_size_half_points)
+            if lines > max_lines:
+                max_lines = lines
+        total += max_lines * line_height_twips + (cell_margin_twips * 2)
+    return total
+
+
+def plan_table_layout_to_fit_page(grid: List[List[str]]) -> Tuple[int, List[int]]:
+    if not grid:
+        return 22, [TEXT_WIDTH_TWIPS]
+    base_half = 22  # 11pt baseline
+    min_half, max_half = 10, 36  # 5pt .. 18pt bounds
+    content_widths_base = compute_content_widths_twips(grid, base_half)
+    # Binary search scale factor via half-point size
+    lo, hi = min_half, max_half
+    best_half = lo
+    best_widths: List[int] = normalize_widths_to_total(content_widths_base, TEXT_WIDTH_TWIPS)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        # scale widths roughly proportional to font size
+        scaled_widths = [int(w * (mid / base_half)) for w in content_widths_base]
+        col_widths = normalize_widths_to_total([max(40, w) for w in scaled_widths], TEXT_WIDTH_TWIPS)
+        height = estimate_table_height_twips_wrapped(grid, col_widths, mid, compact=True)
+        if height <= TEXT_HEIGHT_TWIPS:
+            best_half = mid
+            best_widths = col_widths
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best_half, best_widths
 
 
 def add_table_properties(tbl: ET.Element, total_width_twips: Optional[int], add_borders: bool, autofit: bool, compact: bool) -> None:
@@ -394,6 +519,7 @@ def build_word_table(
     autofit: bool = True,
     font_size_half_points: Optional[int] = None,
     compact: bool = False,
+    explicit_col_widths: Optional[List[int]] = None,
 ) -> ET.Element:
     tbl = ET.Element(f"{{{NS_W}}}tbl")
 
@@ -401,9 +527,11 @@ def build_word_table(
 
     effective_grid = grid if grid else [[""]]
 
-    # Column widths and grid when fixed layout
     col_widths: Optional[List[int]] = None
-    if total_width_twips is not None and not autofit:
+    if explicit_col_widths is not None:
+        col_widths = explicit_col_widths[:]
+        append_tbl_grid(tbl, col_widths)
+    elif total_width_twips is not None and not autofit:
         col_widths = compute_column_widths_twips(effective_grid, total_width_twips)
         append_tbl_grid(tbl, col_widths)
 
@@ -428,13 +556,11 @@ def build_word_document_xml(sheets: List[Tuple[str, List[List[str]]]], fit_to_pa
     body = ET.SubElement(root, f"{{{NS_W}}}body")
 
     for idx, (sheet_name, grid) in enumerate(sheets):
-        # Choose font size if fitting to page
         if fit_to_page:
-            font_half_pt = choose_font_size_for_grid(grid, compact=True)
+            font_half_pt, col_widths = plan_table_layout_to_fit_page(grid)
         else:
-            font_half_pt = None
+            font_half_pt, col_widths = None, None
 
-        # Sheet title paragraph
         title_p = build_word_paragraph(
             f"Sheet: {sheet_name}",
             font_size_half_points=(font_half_pt if font_half_pt is not None else None),
@@ -442,22 +568,20 @@ def build_word_document_xml(sheets: List[Tuple[str, List[List[str]]]], fit_to_pa
         )
         body.append(title_p)
 
-        # Table for the sheet (or table segment)
         tbl = build_word_table(
             grid,
             total_width_twips=TEXT_WIDTH_TWIPS,
             add_borders=True,
-            autofit=not fit_to_page,
+            autofit=(not fit_to_page),
             font_size_half_points=(font_half_pt if font_half_pt is not None else None),
             compact=fit_to_page,
+            explicit_col_widths=col_widths,
         )
         body.append(tbl)
 
-        # Page break between tables (not after the last one)
         if idx < len(sheets) - 1:
             body.append(build_page_break_paragraph())
 
-    # Section properties (required end element in a valid Word doc)
     sectPr = ET.SubElement(body, f"{{{NS_W}}}sectPr")
     pgSz = ET.SubElement(sectPr, f"{{{NS_W}}}pgSz")
     pgSz.set(f"{{{NS_W}}}w", str(PAGE_WIDTH_TWIPS))
