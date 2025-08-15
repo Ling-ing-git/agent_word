@@ -16,12 +16,14 @@ Optional flags:
   --max-cols N               Limit columns per sheet (default: auto)
   --separator-blank-rows N   Split tables by N consecutive empty rows (default: 1)
   --trim-empty-cols          Trim trailing empty columns per table (default: off)
+  --fit-to-page              Try to fit each table onto one page (smaller font, compact spacing)
 
 Note:
 - Numbers/dates are not formatted; values are taken as-is from the XML
 - Shared strings and inline strings are supported
 - Rich text runs are concatenated
 - Tables are split by blank-row separators and each table starts on a new page
+- Borders are added for all tables; width auto-fits to page text area
 """
 
 from __future__ import annotations
@@ -43,6 +45,18 @@ NS_XML = "http://www.w3.org/XML/1998/namespace"
 
 ET.register_namespace("w", NS_W)
 ET.register_namespace("r", NS_REL_OFFICE)
+
+# Page constants (twips)
+PAGE_WIDTH_TWIPS = 11906
+PAGE_HEIGHT_TWIPS = 16838
+MARGIN_LEFT_TWIPS = 1440
+MARGIN_RIGHT_TWIPS = 1440
+MARGIN_TOP_TWIPS = 1440
+MARGIN_BOTTOM_TWIPS = 1440
+HEADER_TWIPS = 708
+FOOTER_TWIPS = 708
+TEXT_WIDTH_TWIPS = PAGE_WIDTH_TWIPS - MARGIN_LEFT_TWIPS - MARGIN_RIGHT_TWIPS
+TEXT_HEIGHT_TWIPS = PAGE_HEIGHT_TWIPS - MARGIN_TOP_TWIPS - MARGIN_BOTTOM_TWIPS
 
 
 def column_letters_to_index(column_letters: str) -> int:
@@ -267,9 +281,47 @@ def split_grid_into_tables(grid: List[List[str]], min_blank_rows_between: int = 
     return tables
 
 
-def build_word_paragraph(text: str) -> ET.Element:
+# Heuristic: estimate table height in twips for a given font size and compact setting
+# Assumptions: one line per cell (no word-wrapping considered), lineHeight ~= fontPt * 20 * 1.2
+# Adds compact cell margins (top+bottom)
+
+def estimate_table_height_twips(grid: List[List[str]], font_size_half_points: int, compact: bool) -> int:
+    if not grid:
+        return 0
+    font_points = font_size_half_points / 2.0
+    line_height_twips = int(font_points * 20 * 1.2)
+    cell_margin_twips = 36 if compact else 108
+    per_row_twips = line_height_twips + (cell_margin_twips * 2)
+    total = per_row_twips * len(grid)
+    return total
+
+
+def choose_font_size_for_grid(grid: List[List[str]], compact: bool) -> int:
+    # Candidate font sizes (half-points): 11pt, 10pt, 9pt, 8pt, 7pt, 6pt
+    candidates = [22, 20, 18, 16, 14, 12]
+    # Reserve some space for the title paragraph
+    title_reserved_twips = int(9 * 20 * 1.2)  # assume ~9pt title height
+    available = max(0, TEXT_HEIGHT_TWIPS - title_reserved_twips)
+    for half_pt in candidates:
+        if estimate_table_height_twips(grid, half_pt, compact=True) <= available:
+            return half_pt
+    return candidates[-1]
+
+
+def build_word_paragraph(text: str, font_size_half_points: Optional[int] = None, compact: bool = False) -> ET.Element:
     p = ET.Element(f"{{{NS_W}}}p")
+    if compact:
+        pPr = ET.SubElement(p, f"{{{NS_W}}}pPr")
+        spacing = ET.SubElement(pPr, f"{{{NS_W}}}spacing")
+        spacing.set(f"{{{NS_W}}}before", "0")
+        spacing.set(f"{{{NS_W}}}after", "0")
     r = ET.SubElement(p, f"{{{NS_W}}}r")
+    if font_size_half_points is not None:
+        rPr = ET.SubElement(r, f"{{{NS_W}}}rPr")
+        sz = ET.SubElement(rPr, f"{{{NS_W}}}sz")
+        sz.set(f"{{{NS_W}}}val", str(font_size_half_points))
+        szCs = ET.SubElement(rPr, f"{{{NS_W}}}szCs")
+        szCs.set(f"{{{NS_W}}}val", str(font_size_half_points))
     # Split on newlines, inserting w:br between runs
     parts = text.split("\n")
     for idx, part in enumerate(parts):
@@ -289,35 +341,116 @@ def build_page_break_paragraph() -> ET.Element:
     return p
 
 
-def build_word_table(grid: List[List[str]]) -> ET.Element:
+def add_table_properties(tbl: ET.Element, total_width_twips: Optional[int], add_borders: bool, autofit: bool, compact: bool) -> None:
+    tblPr = ET.SubElement(tbl, f"{{{NS_W}}}tblPr")
+    if total_width_twips is None:
+        tblW = ET.SubElement(tblPr, f"{{{NS_W}}}tblW")
+        tblW.set(f"{{{NS_W}}}type", "auto")
+    else:
+        tblW = ET.SubElement(tblPr, f"{{{NS_W}}}tblW")
+        tblW.set(f"{{{NS_W}}}w", str(total_width_twips))
+        tblW.set(f"{{{NS_W}}}type", "dxa")
+
+    layout = ET.SubElement(tblPr, f"{{{NS_W}}}tblLayout")
+    layout.set(f"{{{NS_W}}}type", "autofit" if autofit else "fixed")
+
+    if add_borders:
+        borders = ET.SubElement(tblPr, f"{{{NS_W}}}tblBorders")
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            el = ET.SubElement(borders, f"{{{NS_W}}}{side}")
+            el.set(f"{{{NS_W}}}val", "single")
+            el.set(f"{{{NS_W}}}sz", "8")  # ~1pt
+            el.set(f"{{{NS_W}}}space", "0")
+            el.set(f"{{{NS_W}}}color", "auto")
+
+    # Compact cell margins for tighter layout
+    cellMar = ET.SubElement(tblPr, f"{{{NS_W}}}tblCellMar")
+    for side in ("top", "left", "bottom", "right"):
+        el = ET.SubElement(cellMar, f"{{{NS_W}}}{side}")
+        el.set(f"{{{NS_W}}}w", "36" if compact else "108")  # 36=2pt, 108=6pt
+        el.set(f"{{{NS_W}}}type", "dxa")
+
+
+def compute_column_widths_twips(grid: List[List[str]], total_width_twips: int) -> List[int]:
+    num_cols = max((len(row) for row in grid), default=1)
+    num_cols = max(1, num_cols)
+    base = total_width_twips // num_cols
+    widths = [base for _ in range(num_cols)]
+    widths[-1] += total_width_twips - base * num_cols
+    return widths
+
+
+def append_tbl_grid(tbl: ET.Element, col_widths_twips: List[int]) -> None:
+    tblGrid = ET.SubElement(tbl, f"{{{NS_W}}}tblGrid")
+    for w in col_widths_twips:
+        gridCol = ET.SubElement(tblGrid, f"{{{NS_W}}}gridCol")
+        gridCol.set(f"{{{NS_W}}}w", str(w))
+
+
+def build_word_table(
+    grid: List[List[str]],
+    total_width_twips: Optional[int] = None,
+    add_borders: bool = True,
+    autofit: bool = True,
+    font_size_half_points: Optional[int] = None,
+    compact: bool = False,
+) -> ET.Element:
     tbl = ET.Element(f"{{{NS_W}}}tbl")
 
-    # Optional basic table properties for borders could be added here if desired
-    # Ensure at least one empty row with one empty cell if grid is empty
+    add_table_properties(tbl, total_width_twips=total_width_twips, add_borders=add_borders, autofit=autofit, compact=compact)
+
     effective_grid = grid if grid else [[""]]
+
+    # Column widths and grid when fixed layout
+    col_widths: Optional[List[int]] = None
+    if total_width_twips is not None and not autofit:
+        col_widths = compute_column_widths_twips(effective_grid, total_width_twips)
+        append_tbl_grid(tbl, col_widths)
 
     for row_values in effective_grid:
         tr = ET.SubElement(tbl, f"{{{NS_W}}}tr")
         if not row_values:
             row_values = [""]
-        for cell_text in row_values:
+        for col_idx, cell_text in enumerate(row_values):
             tc = ET.SubElement(tr, f"{{{NS_W}}}tc")
-            p = build_word_paragraph(cell_text if cell_text is not None else "")
+            if col_widths is not None:
+                tcPr = ET.SubElement(tc, f"{{{NS_W}}}tcPr")
+                tcW = ET.SubElement(tcPr, f"{{{NS_W}}}tcW")
+                tcW.set(f"{{{NS_W}}}w", str(col_widths[min(col_idx, len(col_widths) - 1)]))
+                tcW.set(f"{{{NS_W}}}type", "dxa")
+            p = build_word_paragraph(cell_text if cell_text is not None else "", font_size_half_points=font_size_half_points, compact=compact)
             tc.append(p)
     return tbl
 
 
-def build_word_document_xml(sheets: List[Tuple[str, List[List[str]]]]) -> bytes:
+def build_word_document_xml(sheets: List[Tuple[str, List[List[str]]]], fit_to_page: bool = False) -> bytes:
     root = ET.Element(f"{{{NS_W}}}document")
     body = ET.SubElement(root, f"{{{NS_W}}}body")
 
     for idx, (sheet_name, grid) in enumerate(sheets):
+        # Choose font size if fitting to page
+        if fit_to_page:
+            font_half_pt = choose_font_size_for_grid(grid, compact=True)
+        else:
+            font_half_pt = None
+
         # Sheet title paragraph
-        title_p = build_word_paragraph(f"Sheet: {sheet_name}")
+        title_p = build_word_paragraph(
+            f"Sheet: {sheet_name}",
+            font_size_half_points=(font_half_pt if font_half_pt is not None else None),
+            compact=fit_to_page,
+        )
         body.append(title_p)
 
         # Table for the sheet (or table segment)
-        tbl = build_word_table(grid)
+        tbl = build_word_table(
+            grid,
+            total_width_twips=TEXT_WIDTH_TWIPS,
+            add_borders=True,
+            autofit=not fit_to_page,
+            font_size_half_points=(font_half_pt if font_half_pt is not None else None),
+            compact=fit_to_page,
+        )
         body.append(tbl)
 
         # Page break between tables (not after the last one)
@@ -327,16 +460,16 @@ def build_word_document_xml(sheets: List[Tuple[str, List[List[str]]]]) -> bytes:
     # Section properties (required end element in a valid Word doc)
     sectPr = ET.SubElement(body, f"{{{NS_W}}}sectPr")
     pgSz = ET.SubElement(sectPr, f"{{{NS_W}}}pgSz")
-    pgSz.set(f"{{{NS_W}}}w", "11906")  # A4 width in twips
-    pgSz.set(f"{{{NS_W}}}h", "16838")  # A4 height in twips
+    pgSz.set(f"{{{NS_W}}}w", str(PAGE_WIDTH_TWIPS))
+    pgSz.set(f"{{{NS_W}}}h", str(PAGE_HEIGHT_TWIPS))
 
     pgMar = ET.SubElement(sectPr, f"{{{NS_W}}}pgMar")
-    pgMar.set(f"{{{NS_W}}}top", "1440")
-    pgMar.set(f"{{{NS_W}}}right", "1440")
-    pgMar.set(f"{{{NS_W}}}bottom", "1440")
-    pgMar.set(f"{{{NS_W}}}left", "1440")
-    pgMar.set(f"{{{NS_W}}}header", "708")
-    pgMar.set(f"{{{NS_W}}}footer", "708")
+    pgMar.set(f"{{{NS_W}}}top", str(MARGIN_TOP_TWIPS))
+    pgMar.set(f"{{{NS_W}}}right", str(MARGIN_RIGHT_TWIPS))
+    pgMar.set(f"{{{NS_W}}}bottom", str(MARGIN_BOTTOM_TWIPS))
+    pgMar.set(f"{{{NS_W}}}left", str(MARGIN_LEFT_TWIPS))
+    pgMar.set(f"{{{NS_W}}}header", str(HEADER_TWIPS))
+    pgMar.set(f"{{{NS_W}}}footer", str(FOOTER_TWIPS))
     pgMar.set(f"{{{NS_W}}}gutter", "0")
 
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True, short_empty_elements=True)
@@ -380,6 +513,7 @@ def xlsx_to_docx(
     max_cols: Optional[int] = None,
     separator_blank_rows: int = 1,
     trim_empty_cols: bool = False,
+    fit_to_page: bool = False,
 ) -> None:
     with zipfile.ZipFile(xlsx_path, "r") as zf:
         shared = extract_shared_strings(zf)
@@ -405,7 +539,7 @@ def xlsx_to_docx(
                         t = trim_trailing_empty_columns(t)
                     prepared.append((sheet_name, t))
 
-    document_xml = build_word_document_xml(prepared)
+    document_xml = build_word_document_xml(prepared, fit_to_page=fit_to_page)
     write_docx(document_xml, docx_path)
 
 
@@ -418,6 +552,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-cols", type=int, default=None, help="Limit number of columns per sheet")
     parser.add_argument("--separator-blank-rows", type=int, default=1, help="Split tables by N consecutive empty rows")
     parser.add_argument("--trim-empty-cols", action="store_true", help="Trim trailing empty columns per table")
+    parser.add_argument("--fit-to-page", action="store_true", help="Try to fit each table onto one page (smaller font, compact spacing)")
     return parser.parse_args(argv)
 
 
@@ -432,6 +567,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_cols=args.max_cols,
             separator_blank_rows=args.separator_blank_rows,
             trim_empty_cols=args.trim_empty_cols,
+            fit_to_page=args.fit_to_page,
         )
     except Exception as exc:
         sys.stderr.write(f"Error: {exc}\n")
