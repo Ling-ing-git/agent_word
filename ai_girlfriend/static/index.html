@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>AI 女友 · 悠然</title>
+	<style>
+		:root { --bg: #0b1020; --panel: #131a2b; --text: #dbe5ff; --muted: #95a3c5; --accent: #7aa2f7; }
+		* { box-sizing: border-box; }
+		body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, PingFang SC, Noto Sans SC, "Helvetica Neue", Arial; background: var(--bg); color: var(--text); }
+		.container { max-width: 820px; margin: 0 auto; padding: 16px; }
+		header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+		.brand { display: flex; align-items: center; gap: 10px; }
+		.brand .dot { width: 10px; height: 10px; border-radius: 50%; background: #62d5b4; box-shadow: 0 0 10px #62d5b4; }
+		.brand h1 { font-size: 18px; margin: 0; letter-spacing: 0.5px; color: #e7efff; }
+		.panel { background: var(--panel); border: 1px solid #1d2744; border-radius: 12px; overflow: hidden; }
+		.messages { height: calc(100vh - 240px); padding: 12px; overflow-y: auto; scroll-behavior: smooth; }
+		.msg { max-width: 80%; padding: 10px 12px; border-radius: 12px; line-height: 1.55; margin: 10px 0; white-space: pre-wrap; word-break: break-word; }
+		.msg.user { background: #28314d; margin-left: auto; border-bottom-right-radius: 4px; }
+		.msg.assistant { background: #222b44; margin-right: auto; border-bottom-left-radius: 4px; }
+		.footer { display: flex; align-items: center; gap: 10px; border-top: 1px solid #1d2744; padding: 10px; background: #171f33; }
+		input, button { font: inherit; }
+		input[type="text"] { flex: 1; background: #0f1528; color: var(--text); border: 1px solid #1f2a4a; padding: 12px 14px; border-radius: 10px; outline: none; }
+		input[type="text"]::placeholder { color: var(--muted); }
+		button { background: var(--accent); color: #0b1020; border: none; padding: 10px 16px; border-radius: 10px; cursor: pointer; }
+		.helper { color: var(--muted); font-size: 12px; padding: 8px 12px; border-top: 1px dashed #263252; }
+	</style>
+</head>
+<body>
+	<div class="container">
+		<header>
+			<div class="brand">
+				<div class="dot"></div>
+				<h1>AI 女友 · 悠然</h1>
+			</div>
+		</header>
+
+		<div class="panel">
+			<div id="messages" class="messages"></div>
+			<div class="helper">你可以跟我聊心情、日常、计划和目标。我会以温柔、理性的方式陪伴你～</div>
+			<div class="footer">
+				<input id="input" type="text" placeholder="说点什么...（Shift+Enter换行）" />
+				<button id="send">发送</button>
+			</div>
+		</div>
+	</div>
+
+	<script>
+		const messagesEl = document.getElementById('messages');
+		const inputEl = document.getElementById('input');
+		const sendBtn = document.getElementById('send');
+		const SESSION_KEY = 'aigf_session_id';
+
+		function ensureSessionId() {
+			let sid = localStorage.getItem(SESSION_KEY);
+			return sid || null;
+		}
+
+		function saveSessionId(sid) {
+			localStorage.setItem(SESSION_KEY, sid);
+		}
+
+		function appendMessage(role, content) {
+			const div = document.createElement('div');
+			div.className = `msg ${role}`;
+			div.textContent = content;
+			messagesEl.appendChild(div);
+			messagesEl.scrollTop = messagesEl.scrollHeight;
+		}
+
+		async function sendMessage() {
+			const text = inputEl.value.trim();
+			if (!text) return;
+			appendMessage('user', text);
+			inputEl.value = '';
+
+			const payload = { session_id: ensureSessionId(), message: text };
+			try {
+				const res = await fetch('/api/chat', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify(payload)
+				});
+				const data = await res.json();
+				if (data.session_id) saveSessionId(data.session_id);
+				appendMessage('assistant', data.reply || '[无响应]');
+			} catch (e) {
+				appendMessage('assistant', '网络似乎出了一点问题，我们再试一次？');
+			}
+		}
+
+		sendBtn.addEventListener('click', sendMessage);
+		inputEl.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter' && !e.shiftKey) {
+				e.preventDefault();
+				sendMessage();
+			}
+		});
+	</script>
+</body>
+</html>
