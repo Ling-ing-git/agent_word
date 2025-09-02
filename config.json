@@ -1,0 +1,17 @@
+[
+    {
+        "url": "https://api.openai.com/v1",
+        "model": "gpt-3.5-turbo",
+        "apikey": "your-openai-api-key-1"
+    },
+    {
+        "url": "https://api.openai.com/v1",
+        "model": "gpt-4",
+        "apikey": "your-openai-api-key-2"
+    },
+    {
+        "url": "https://your-custom-endpoint.com/v1",
+        "model": "custom-model",
+        "apikey": "your-custom-api-key"
+    }
+]

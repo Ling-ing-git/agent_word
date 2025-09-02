@@ -1,0 +1,33 @@
+[
+    {
+        "type": "对话",
+        "content": {
+            "name": "玄月",
+            "time": "2025-01-26 09:25",
+            "message": "你有小洞洞吗"
+        }
+    },
+    {
+        "type": "总结",
+        "content": {
+            "summary": "初次见面的简单问候和个人问题",
+            "summarized_records": [
+                {
+                    "type": "对话",
+                    "content": {
+                        "name": "玄月",
+                        "time": "2025-01-26 09:25",
+                        "message": "你有小洞洞吗"
+                    }
+                }
+            ]
+        }
+    },
+    {
+        "type": "操作",
+        "content": {
+            "tool_name": "搜索",
+            "result": "搜索结果：关于数字人身体构造的相关信息"
+        }
+    }
+]
